@@ -515,15 +515,15 @@
     }
 
     function formatExplanationBlocks(expText) {
-      if (!expText) return '';
+      if (!expText) return '<div class="p-3.5 rounded-xl border bg-slate-900/80 border-slate-800 text-slate-400 text-xs italic">Explanation extracting in background...</div>';
       const blocks = expText.split(/\n\s*\n/).filter(Boolean);
       return blocks.map(blk => {
-        const isCorrect = /^Answers?\s+[A-Ha-h][^\n]*\(\s*correct/i.test(blk.trim());
+        const isCorrect = /^Answers?\s*[A-Na-n][^\n]*\(\s*correct/i.test(blk.trim());
         const borderCls = isCorrect
           ? 'bg-emerald-950/35 border-emerald-500/40 text-emerald-100'
           : 'bg-slate-900/80 border-slate-800 text-slate-300';
         const formatted = blk.replace(
-          /^(Answers?\s+[A-Ha-h](?:\s*(?:,|and|&)\s*[A-Ha-h])*\s*\([^)]+\)\s*:?)/i,
+          /^(Answers?\s*[A-Na-n](?:\s*(?:,|and|&)\s*[A-Na-n])*\s*\([^)]+\)\s*:?)/i,
           `<span class="font-bold ${isCorrect ? 'text-emerald-400' : 'text-amber-300'}">$1</span>`
         );
         return `<div class="p-3.5 rounded-xl border ${borderCls} text-xs leading-relaxed">${formatted}</div>`;

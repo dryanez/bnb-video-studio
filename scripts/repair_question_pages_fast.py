@@ -94,6 +94,8 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
         q.get("options", {}).get("A") in (None, "Option A")
         or q.get("question") in (None, "", "Clinical Board Review Question")
         or not q.get("peer_statistics")
+        or not (q.get("explanation") or "").strip()
+        or "visual_metadata" not in q
         for q in questions
     )
     if not needs_repair:
@@ -111,28 +113,40 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
         im = Image.open(io.BytesIO(doc.extract_image(exp_xref)["image"]))
         arr = np.array(im)
 
-        # 1. Detect white/highlighted options box segments (x around 214, w around 623) in top 1550px
-        scan_h = min(im.height, 1550)
-        white_mask = (
-            (arr[:scan_h, :, 0] > 250)
-            & (arr[:scan_h, :, 1] > 250)
-            & (arr[:scan_h, :, 2] <= 255)
-            & ((arr[:scan_h, :, 2].astype(int) - arr[:scan_h, :, 0].astype(int)) < 4)
+        # 1. Locate all large white cards on the page (Options card + Score card + Explanation card)
+        full_white = (
+            (arr[:, :, 0] > 250)
+            & (arr[:, :, 1] > 250)
+            & (arr[:, :, 2] <= 255)
+            & ((arr[:, :, 2].astype(int) - arr[:, :, 0].astype(int)) < 4)
         ).astype(np.uint8) * 255
-        white_mask[:120, :] = 0
-        cnts, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        full_white[:120, :] = 0
+        all_cnts, _ = cv2.findContours(full_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Explanation card is the bottom-most wide white card (w > 1000, h > 220)
+        exp_cards = [
+            cv2.boundingRect(c)
+            for c in all_cnts
+            if cv2.boundingRect(c)[2] > 1000 and cv2.boundingRect(c)[3] > 220 and cv2.boundingRect(c)[1] > 400
+        ]
+        exp_cards.sort(key=lambda r: r[1], reverse=True)
+        exp_card = exp_cards[0] if exp_cards else None
+        exp_card_top = exp_card[1] if exp_card else int(im.height * 0.55)
+
+        # Options box segments live above exp_card_top (x around 214, w around 623)
         segs = [
             cv2.boundingRect(c)
-            for c in cnts
+            for c in all_cnts
             if 185 <= cv2.boundingRect(c)[0] <= 245
             and 540 <= cv2.boundingRect(c)[2] <= 720
-            and cv2.boundingRect(c)[3] >= 35
+            and cv2.boundingRect(c)[3] >= 30
+            and cv2.boundingRect(c)[1] < exp_card_top - 40
         ]
         if segs:
             opt_top = max(140, min(s[1] for s in segs) - 120)
-            opt_bot = min(im.height - 40, max(s[1] + s[3] for s in segs) + 85)
+            opt_bot = min(exp_card_top - 10, max(s[1] + s[3] for s in segs) + 90)
         else:
-            opt_top, opt_bot = 400, min(im.height - 40, 1300)
+            opt_top, opt_bot = 400, min(exp_card_top - 10, 1450)
 
         # 2. OCR the top question + options section at native 1:1 resolution
         top_crop = im.crop((180, 110, min(im.width, 1650), min(im.height, opt_bot + 30)))
@@ -150,7 +164,7 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
             if tl == "explanation" or "answered correctly" in tl or "time spent" in tl:
                 exp_header_y = min(exp_header_y, b[0][1] - 10)
 
-        # 3. Identify option markers (A)-(G)
+        # 3. Identify option markers (A)-(N) (supports up to 14 options like Cellular Adaptations Q1)
         markers = []
         marker_inline = {}
         for b, t in boxes:
@@ -165,9 +179,9 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                 .replace("○", "O")
             )
             if 200 <= x0 <= 335 and y0 >= opt_top - 35:
-                m = re.match(r"^[O\(\)\[\]\s]*([A-Ga-g])[\.\)\]\s]+(.*)$", t_clean)
+                m = re.match(r"^[O\(\)\[\]\s]*([A-Na-n])[\.\)\]\s]+(.*)$", t_clean)
                 if not m:
-                    m = re.match(r"^[O\(\)\[\]\s]*\(([A-Ga-g])\)\s*(.*)$", t_clean)
+                    m = re.match(r"^[O\(\)\[\]\s]*\(([A-Na-n])\)\s*(.*)$", t_clean)
                 if m:
                     let = m.group(1).upper()
                     rem = m.group(2).strip()
@@ -183,7 +197,7 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
         fig_rect = None
         fig_cards = [
             cv2.boundingRect(c)
-            for c in cnts
+            for c in all_cnts
             if cv2.boundingRect(c)[0] > 310
             and cv2.boundingRect(c)[2] > 180
             and cv2.boundingRect(c)[3] > 95
@@ -301,10 +315,9 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                         pstats[mlet] = float(m_pct.group(1))
                     elif 285 <= bx0 <= 740:
                         t_clean = clean_spaces(t)
-                        if not re.match(r"^[O\(\)\[\]\s]*[A-Ga-g][\.\)\]]", t_clean):
+                        if not re.match(r"^[O\(\)\[\]\s]*[A-Na-n][\.\)\]]", t_clean):
                             words.append(t_clean)
             raw_opt = clean_spaces(" ".join(words)) or mlet
-            # Strip trailing percentage if merged into option text box
             m_tail_pct = re.search(r"\s+(\d{1,3}(?:\.\d{1,2})?)\s*%\s*$", raw_opt)
             if m_tail_pct:
                 pstats[mlet] = float(m_tail_pct.group(1))
@@ -316,36 +329,32 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
         if pstats:
             q_obj["peer_statistics"] = pstats
 
-        # 7. Audit & Repair Explanation Visual (prevent clipped figures/vertical-bar slides & false blue-header table replacements)
-        full_white = (
-            (arr[:, :, 0] > 252) & (arr[:, :, 1] > 252) & (arr[:, :, 2] > 252)
-        ).astype(np.uint8) * 255
-        full_white[:500, :] = 0
-        ecnts, _ = cv2.findContours(full_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        exp_cards = [
-            cv2.boundingRect(c)
-            for c in ecnts
-            if cv2.boundingRect(c)[2] > 1000 and cv2.boundingRect(c)[3] > 350
-        ]
-        if exp_cards:
-            exp_cards.sort(key=lambda r: r[1], reverse=True)
-            cx, cy, cw, ch = exp_cards[0]
+        # 7. Audit & Repair Explanation Visual AND Missing Explanation Text via OpenCV Card Geometry
+        if exp_card:
+            cx, cy, cw, ch = exp_card
+            # Blue breadcrumb line sits around cy + 25..50; visual region begins at cy + 65
             vis_top = cy + 65
-            if cy + 145 < cy + ch - 25:
-                card_sub = arr[cy + 145 : cy + ch - 20, :]
-                dark_left = (
-                    (card_sub[:, 230:350, 0] < 180) | (card_sub[:, 230:350, 1] < 180)
-                ).sum(axis=1)
-                para_rows = np.where(dark_left > 5)[0]
-                vis_bot = (
-                    (cy + 145) + int(para_rows[0]) - 12
-                    if len(para_rows) > 0
-                    else vis_top
-                )
-            else:
-                vis_bot = vis_top
+            # Left-aligned explanation paragraphs ('Answer X...') always have dark ink at x = 230..340
+            # (whereas all centered slides/tables/figures sit at x > 360)
+            scan_start = min(cy + 68, cy + ch - 25)
+            card_sub = arr[scan_start : cy + ch - 15, :]
+            # Dark gray/black text ink (exclude blue breadcrumb ink where B - R > 40)
+            is_dark_text = (
+                (card_sub[:, 230:345, 0] < 165)
+                & (card_sub[:, 230:345, 1] < 165)
+                & ((card_sub[:, 230:345, 2].astype(int) - card_sub[:, 230:345, 0].astype(int)) < 35)
+            )
+            dark_left = is_dark_text.sum(axis=1)
+            para_rows = np.where(dark_left > 4)[0]
+            text_start_y = (
+                scan_start + int(para_rows[0])
+                if len(para_rows) > 0
+                else cy + 75
+            )
+            vis_bot = text_start_y - 12
 
-            if (vis_bot - vis_top) > 105:
+            # 7A. Extract/Repair Explanation Visual if a visual gap exists between vis_top and vis_bot
+            if (vis_bot - vis_top) > 95:
                 ecrop = im.crop((220, vis_top, cx + cw - 20, vis_bot))
                 ecarr = np.array(ecrop)
                 ediff = np.abs(ecarr.astype(np.int16) - 255).sum(axis=2)
@@ -358,29 +367,86 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                     y1 = min(ecrop.height, int(ys.max()) + pad)
                     clean_ecrop = ecrop.crop((x0, y0, x1, y1))
 
-                    # Check if raw visual is a true full-width horizontal-banner B&B slide (blue banner >= 680px wide)
                     hsv = cv2.cvtColor(np.array(clean_ecrop), cv2.COLOR_RGB2HSV)
                     bmask = cv2.inRange(hsv, np.array([95, 100, 100]), np.array([125, 255, 255]))
                     max_bspan = int(np.max((bmask > 0).sum(axis=1))) if bmask.size > 0 else 0
                     is_true_horiz_slide = (max_bspan >= 660 and clean_ecrop.width >= 680)
 
-                    vmeta = q_obj.get("visual_metadata") or {}
                     out_sname = f"q_{q_idx + 1}_lecture_slide.png"
                     out_spath = img_dir / out_sname
                     s_rel = f"/quizzes/{rel_stem_str}/images/{out_sname}"
 
-                    # If it was a regular figure (might have had clipped axes/left text) OR a false slide replacement on a narrow blue-header table (<660px):
-                    if not is_true_horiz_slide:
+                    # Save unclipped visual if it's a non-slide OR if the slide file was missing/null
+                    if not is_true_horiz_slide or not q_obj.get("lecture_slide_image") or not out_spath.exists():
                         clean_ecrop.save(str(out_spath))
                         q_obj["lecture_slide_image"] = s_rel
                         q_obj["visual_metadata"] = {
                             "has_visual": True,
                             "image_rel": s_rel,
-                            "type": "regular_medical_figure",
+                            "type": "lecture_slide_cropped" if is_true_horiz_slide else "regular_medical_figure",
                             "matched_deck": None,
                             "matched_slide": None,
                             "confidence_score": 0,
                         }
+
+            # 7B. Repair Missing / Empty / Corrupted Explanation Text
+            cur_exp = (q_obj.get("explanation") or "").strip()
+            if not cur_exp or "IncorrectAnswer" in cur_exp or len(cur_exp) < 40:
+                exp_text_crop = im.crop(
+                    (210, max(cy + 60, text_start_y - 15), cx + cw - 15, min(im.height - 60, cy + ch - 10))
+                )
+                eres, _ = engine(np.array(exp_text_crop))
+                eboxes = sorted(eres or [], key=lambda b: (b[0][0][1], b[0][0][0]))
+                blocks = []
+                curr_b = []
+                for b, txt, sc in eboxes:
+                    ct = clean_spaces(txt)
+                    if not ct:
+                        continue
+                    ctl = ct.lower()
+                    if any(
+                        k in ctl
+                        for k in [
+                            "total time taken",
+                            "boards&beyond",
+                            "boards & beyond",
+                            "feedback",
+                            "suspend",
+                            "end quiz",
+                            "mcgraw",
+                            "statistics",
+                        ]
+                    ):
+                        continue
+                    # Match Answer X (correct/incorrect) even if space was omitted by OCR
+                    m_ans = re.match(
+                        r"^Answers?\s*([A-Na-n])\b[^\n]*?\((correct|incorrect)",
+                        ct,
+                        re.I,
+                    )
+                    if m_ans:
+                        if m_ans.group(2).lower().startswith("correct"):
+                            q_obj["correct_answer"] = m_ans.group(1).upper()
+                        if curr_b:
+                            blocks.append(" ".join(curr_b))
+                            curr_b = []
+                        curr_b.append(ct)
+                    elif re.match(r"^Answers?\s+[A-Na-n](?:\s*(?:,|and|&)\s*[A-Na-n])*\s*\(", ct, re.I):
+                        if curr_b:
+                            blocks.append(" ".join(curr_b))
+                            curr_b = []
+                        curr_b.append(ct)
+                    else:
+                        curr_b.append(ct)
+                if curr_b:
+                    blocks.append(" ".join(curr_b))
+                if blocks:
+                    q_obj["explanation"] = "\n\n".join(blocks)
+            else:
+                # Also verify correct_answer from existing explanation text (e.g. Answer L (correct answer))
+                m_corr = re.search(r"Answer\s+([A-Na-n])\s*\(\s*correct", cur_exp, re.I)
+                if m_corr:
+                    q_obj["correct_answer"] = m_corr.group(1).upper()
 
     quiz_json_path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
