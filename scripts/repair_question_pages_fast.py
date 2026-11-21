@@ -95,6 +95,7 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
         or q.get("question") in (None, "", "Clinical Board Review Question")
         or not q.get("peer_statistics")
         or not (q.get("explanation") or "").strip()
+        or not re.match(r"^Answers?\s*[A-Na-n][^\n]{0,40}\(\s*correct", (q.get("explanation") or "").strip(), re.I)
         or "visual_metadata" not in q
         for q in questions
     )
@@ -194,51 +195,64 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
         real_opt_top = markers[0][0] - 25 if markers else opt_top
 
         # 4. Detect Question Figure / Table / Graph above real_opt_top
+        # Unifies inner white plot cards AND outer axis labels/titles (e.g. Wiggers Diagram 'Pressure (mmHg)', '150..10', 'Time')
         fig_rect = None
-        fig_cards = [
+        bg = np.array([246, 246, 255], dtype=np.int16)
+        sub_h = max(140, int(real_opt_top - 8))
+        sub_arr = arr[:sub_h, :]
+        diff = np.abs(sub_arr.astype(np.int16) - bg).sum(axis=2)
+        # diff > 12 captures both pure white plot cards ([255,255,255] -> diff=18) and dark ink/lines/axes
+        tmask = (diff > 12).astype(np.uint8) * 255
+        tmask[:125, :] = 0
+        tmask[:, :315] = 0
+        tmask[:, 1550:] = 0
+
+        # Zero out full-width question text rows (which have dark text ink at x=205..310)
+        left_text_ink = (diff[:, 205:310] > 35).sum(axis=1)
+        for ry in range(len(left_text_ink)):
+            if left_text_ink[ry] > 2:
+                tmask[max(0, ry - 6) : min(tmask.shape[0], ry + 18), :] = 0
+
+        # First check if there is a substantial figure core (width > 160, height > 75)
+        kernel_core = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 18))
+        closed_core = cv2.morphologyEx(tmask, cv2.MORPH_CLOSE, kernel_core)
+        ccnts, _ = cv2.findContours(closed_core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        core_blocks = [
             cv2.boundingRect(c)
-            for c in all_cnts
-            if cv2.boundingRect(c)[0] > 310
-            and cv2.boundingRect(c)[2] > 180
-            and cv2.boundingRect(c)[3] > 95
-            and (cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3]) < real_opt_top + 12
+            for c in ccnts
+            if cv2.boundingRect(c)[2] > 160 and cv2.boundingRect(c)[3] > 70
         ]
-        if fig_cards:
-            fig_cards.sort(key=lambda r: r[2] * r[3], reverse=True)
-            fig_rect = fig_cards[0]
-        else:
-            bg = np.array([246, 246, 255], dtype=np.int16)
-            sub_h = max(140, int(real_opt_top - 10))
-            sub_arr = arr[:sub_h, :]
-            diff = np.abs(sub_arr.astype(np.int16) - bg).sum(axis=2)
-            tmask = (diff > 15).astype(np.uint8) * 255
-            tmask[:130, :] = 0
-            tmask[:, :370] = 0
-            tmask[:, 1550:] = 0
-            # Zero out full-width text rows (which have ink at x=205..355)
-            left_ink = (diff[:, 205:355] > 25).sum(axis=1)
-            for ry in range(len(left_ink)):
-                if left_ink[ry] > 3:
-                    tmask[max(0, ry - 6) : min(tmask.shape[0], ry + 18), :] = 0
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 18))
-            closed = cv2.morphologyEx(tmask, cv2.MORPH_CLOSE, kernel)
-            tcnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            # Filter >180w and >75h to exclude the 65x65 circular pencil button
-            tblocks = [
-                cv2.boundingRect(c)
-                for c in tcnts
-                if cv2.boundingRect(c)[2] > 180 and cv2.boundingRect(c)[3] > 75
-            ]
-            if tblocks:
-                x0 = min(r[0] for r in tblocks)
-                y0 = min(r[1] for r in tblocks)
-                x1 = max(r[0] + r[2] for r in tblocks)
-                y1 = max(r[1] + r[3] for r in tblocks)
-                fig_rect = (x0, y0, x1 - x0, y1 - y0)
+        if core_blocks:
+            cx0 = min(r[0] for r in core_blocks)
+            cy0 = min(r[1] for r in core_blocks)
+            cx1 = max(r[0] + r[2] for r in core_blocks)
+            cy1 = max(r[1] + r[3] for r in core_blocks)
+            # Expand to include any nearby outer axis labels/ticks/titles (within 95px horizontally, 55px vertically)
+            # while excluding the 65x65 circular pencil button on the far right (x > cx1 + 25 and w < 85, h < 85)
+            acnts, _ = cv2.findContours(tmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            fx0, fy0, fx1, fy1 = cx0, cy0, cx1, cy1
+            for c in acnts:
+                rx, ry, rw, rh = cv2.boundingRect(c)
+                if rw < 3 and rh < 3:
+                    continue
+                # Ignore isolated circular pencil button on the right of tables
+                if rx > cx1 + 15 and rw < 90 and rh < 90:
+                    continue
+                if (
+                    rx >= cx0 - 110
+                    and (rx + rw) <= cx1 + 40
+                    and ry >= cy0 - 45
+                    and (ry + rh) <= min(sub_h, cy1 + 65)
+                ):
+                    fx0 = min(fx0, rx)
+                    fy0 = min(fy0, ry)
+                    fx1 = max(fx1, rx + rw)
+                    fy1 = max(fy1, ry + rh)
+            fig_rect = (fx0, fy0, fx1 - fx0, fy1 - fy0)
 
         if fig_rect:
             fx, fy, fw, fh = fig_rect
-            pad = 10
+            pad = 12
             fcrop = im.crop(
                 (
                     max(0, fx - pad),
@@ -281,11 +295,12 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                 continue
             if fig_rect:
                 fx, fy, fw, fh = fig_rect
+                # Check if box center or bounds fall inside figure region
+                bcx = (bx0 + bx1) / 2
+                bcy = (by0 + by1) / 2
                 if (
-                    bx0 >= fx - 25
-                    and bx1 <= fx + fw + 45
-                    and by0 >= fy - 20
-                    and by1 <= fy + fh + 20
+                    (fx - 30 <= bcx <= fx + fw + 45 and fy - 25 <= bcy <= fy + fh + 25)
+                    or (bx0 >= fx - 30 and bx1 <= fx + fw + 45 and by0 >= fy - 25 and by1 <= fy + fh + 25)
                 ):
                     continue
             vig_lines.append(clean_spaces(t))
@@ -329,16 +344,12 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
         if pstats:
             q_obj["peer_statistics"] = pstats
 
-        # 7. Audit & Repair Explanation Visual AND Missing Explanation Text via OpenCV Card Geometry
+        # 7. Audit & Repair Explanation Visual AND Missing/Truncated Explanation Text via OpenCV Card Geometry
         if exp_card:
             cx, cy, cw, ch = exp_card
-            # Blue breadcrumb line sits around cy + 25..50; visual region begins at cy + 65
             vis_top = cy + 65
-            # Left-aligned explanation paragraphs ('Answer X...') always have dark ink at x = 230..340
-            # (whereas all centered slides/tables/figures sit at x > 360)
             scan_start = min(cy + 68, cy + ch - 25)
             card_sub = arr[scan_start : cy + ch - 15, :]
-            # Dark gray/black text ink (exclude blue breadcrumb ink where B - R > 40)
             is_dark_text = (
                 (card_sub[:, 230:345, 0] < 165)
                 & (card_sub[:, 230:345, 1] < 165)
@@ -376,7 +387,6 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                     out_spath = img_dir / out_sname
                     s_rel = f"/quizzes/{rel_stem_str}/images/{out_sname}"
 
-                    # Save unclipped visual if it's a non-slide OR if the slide file was missing/null
                     if not is_true_horiz_slide or not q_obj.get("lecture_slide_image") or not out_spath.exists():
                         clean_ecrop.save(str(out_spath))
                         q_obj["lecture_slide_image"] = s_rel
@@ -389,9 +399,13 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                             "confidence_score": 0,
                         }
 
-            # 7B. Repair Missing / Empty / Corrupted Explanation Text
+            # 7B. Repair Missing / Empty / Top-Truncated Explanation Text
+            # Every valid explanation begins with 'Answer X (correct answer)' in its first 70 chars
             cur_exp = (q_obj.get("explanation") or "").strip()
-            if not cur_exp or "IncorrectAnswer" in cur_exp or len(cur_exp) < 40:
+            starts_with_correct = bool(
+                re.match(r"^Answers?\s*[A-Na-n][^\n]{0,40}\(\s*correct", cur_exp, re.I)
+            )
+            if not cur_exp or not starts_with_correct or "IncorrectAnswer" in cur_exp or len(cur_exp) < 50:
                 exp_text_crop = im.crop(
                     (210, max(cy + 60, text_start_y - 15), cx + cw - 15, min(im.height - 60, cy + ch - 10))
                 )
@@ -418,7 +432,6 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                         ]
                     ):
                         continue
-                    # Match Answer X (correct/incorrect) even if space was omitted by OCR
                     m_ans = re.match(
                         r"^Answers?\s*([A-Na-n])\b[^\n]*?\((correct|incorrect)",
                         ct,
@@ -431,7 +444,7 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                             blocks.append(" ".join(curr_b))
                             curr_b = []
                         curr_b.append(ct)
-                    elif re.match(r"^Answers?\s+[A-Na-n](?:\s*(?:,|and|&)\s*[A-Na-n])*\s*\(", ct, re.I):
+                    elif re.match(r"^Answers?\s*[A-Na-n](?:\s*(?:,|and|&)\s*[A-Na-n])*\s*\(", ct, re.I):
                         if curr_b:
                             blocks.append(" ".join(curr_b))
                             curr_b = []
@@ -443,8 +456,7 @@ def repair_single_quiz(pdf_path: Path, force: bool = False) -> tuple:
                 if blocks:
                     q_obj["explanation"] = "\n\n".join(blocks)
             else:
-                # Also verify correct_answer from existing explanation text (e.g. Answer L (correct answer))
-                m_corr = re.search(r"Answer\s+([A-Na-n])\s*\(\s*correct", cur_exp, re.I)
+                m_corr = re.search(r"Answer\s*([A-Na-n])\s*\(\s*correct", cur_exp, re.I)
                 if m_corr:
                     q_obj["correct_answer"] = m_corr.group(1).upper()
 
